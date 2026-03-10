@@ -5,7 +5,7 @@ import re
 import zipfile
 import io
 import gc
-from openpyxl import Workbook
+
 
 CSV_COLUMNS = [
     'Bill Date', 'Bill Number', 'Project Name', 'SubTotal',
@@ -50,13 +50,8 @@ def extract_data_from_pdf(pdf_file):
 
 def generate_excel(df):
     output = io.BytesIO()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Invoices"
-    ws.append(list(df.columns))
-    for _, row in df.iterrows():
-        ws.append(list(row))
-    wb.save(output)
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Invoices')
     output.seek(0)
     return output
 
