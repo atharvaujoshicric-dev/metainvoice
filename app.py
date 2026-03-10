@@ -5,48 +5,27 @@ import re
 import zipfile
 import io
 
-# --- 1. Page Config ---
 st.set_page_config(page_title="Invoice Intel Pro", page_icon="💎", layout="wide")
 
-# Modern Styling
+# --- UI Styling ---
 st.markdown("""
     <style>
-    .stMetric { border: 1px solid #e1e4e8; padding: 15px; border-radius: 10px; background-color: white; }
-    .main { background-color: #f8f9fa; }
+    .stMetric { border: 1px solid #e1e4e8; padding: 10px; border-radius: 10px; background-color: #ffffff; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. Helper Functions ---
-
 def clean_amt(value):
-    if not value or value == "N/A": return 0.0
-    clean_val = re.sub(r'[^\d.]', '', str(value))
-    try: return float(clean_val)
+    if not value: return 0.0
+    val = re.sub(r'[^\d.]', '', str(value))
+    try: return float(val)
     except: return 0.0
 
-@st.cache_data(show_spinner="Unpacking ZIP layers...")
-def recursive_get_pdfs(zip_bytes):
-    """Deep scan for PDFs in nested ZIP structures."""
-    pdf_files = []
-    def extract_recursive(data):
-        with zipfile.ZipFile(io.BytesIO(data)) as z:
-            for info in z.infolist():
-                if info.is_dir(): continue
-                content = z.read(info.filename)
-                if info.filename.lower().endswith('.pdf'):
-                    pdf_files.append((info.filename, content))
-                elif info.filename.lower().endswith('.zip'):
-                    extract_recursive(content)
-    extract_recursive(zip_bytes)
-    return pdf_files
-
-def parse_pdf(content):
-    """Extracts data from PDF bytes with error handling."""
+def extract_pdf_data(pdf_stream):
+    """Memory-efficient extraction."""
     try:
-        with pdfplumber.open(io.BytesIO(content)) as pdf:
+        with pdfplumber.open(pdf_stream) as pdf:
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
         
-        # Regex patterns
         patterns = {
             "inv": r"Invoice (?:no\.|ID)\s*([A-Z0-9-]+)",
             "proj": r"Tax invoice for\s+(.*)",
@@ -61,68 +40,60 @@ def parse_pdf(content):
         
         return {
             "Invoice #": res['inv'],
-            "Project Name": res['proj'].strip(),
+            "Project Name": res['proj'].strip()[:50], # Truncate long names
             "Subtotal": s_val,
             "IGST": t_val,
             "Total": s_val + t_val,
             "Date": res['date'],
             "GSTIN": res['gst']
         }
-    except Exception:
-        return None
+    except: return None
 
-# --- 3. UI Flow ---
-
+# --- Main Logic ---
 st.title("💎 Invoice Intel Pro")
-st.write("Upload folders or ZIPs. I'll handle the extraction and formatting.")
+st.caption("Deep-recursive extraction for high-volume uploads")
 
-uploaded_zips = st.file_uploader("Upload ZIP files", type="zip", accept_multiple_files=True)
+files = st.file_uploader("Upload ZIPs", type="zip", accept_multiple_files=True)
 
-if uploaded_zips:
-    all_pdfs = []
-    for f in uploaded_zips:
-        all_pdfs.extend(recursive_get_pdfs(f.read()))
+if files:
+    all_data = []
     
-    if all_pdfs:
-        st.success(f"🔍 Found {len(all_pdfs)} PDFs. Extracting data...")
+    # We use a placeholder to avoid screen-jump
+    status = st.status("🚀 Initializing deep scan...", expanded=True)
+    
+    # Recursive processing inside a flat loop to save memory
+    zips_to_process = [f.read() for f in files]
+    
+    processed_count = 0
+    
+    # Process files one by one
+    for zip_bytes in zips_to_process:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+            for filename in z.namelist():
+                if filename.lower().endswith('.pdf'):
+                    with z.open(filename) as f:
+                        data = extract_pdf_data(io.BytesIO(f.read()))
+                        if data:
+                            all_data.append(data)
+                            processed_count += 1
+                            status.write(f"✅ Processed: {filename[:40]}...")
+
+    if all_data:
+        status.update(label=f"Extraction Complete! ({processed_count} files)", state="complete")
+        df = pd.DataFrame(all_data)
         
-        # Progress Tracking
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        results = []
-
-        for idx, (name, content) in enumerate(all_pdfs):
-            # Update Progress
-            curr_progress = (idx + 1) / len(all_pdfs)
-            progress_bar.progress(curr_progress)
-            status_text.caption(f"Processing {idx+1}/{len(all_pdfs)}: **{name[:40]}**")
-            
-            data = parse_pdf(content)
-            if data: results.append(data)
+        # Dashboard
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Files", len(df))
+        col2.metric("Total Value", f"₹{df['Total'].sum():,.2f}")
+        col3.metric("Total Tax", f"₹{df['IGST'].sum():,.2f}")
         
-        status_text.empty()
-        progress_bar.empty()
-
-        if results:
-            df = pd.DataFrame(results)
-            
-            # Dashboard
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Invoices", len(df))
-            c2.metric("Net Amount", f"₹{df['Total'].sum():,.2f}")
-            c3.metric("Tax Collected", f"₹{df['IGST'].sum():,.2f}")
-
-            st.dataframe(df.style.format({"Subtotal": "{:,.2f}", "IGST": "{:,.2f}", "Total": "{:,.2f}"}), use_container_width=True)
-
-            # Excel Generation
-            out = io.BytesIO()
-            with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name='Data')
-                book = writer.book
-                sheet = writer.sheets['Data']
-                curr_fmt = book.add_format({'num_format': '#,##0.00 "INR"'})
-                sheet.set_column('C:E', 15, curr_fmt)
-
-            st.download_button("📥 Download Excel Report", out.getvalue(), "Invoices.xlsx", "application/vnd.ms-excel")
+        st.dataframe(df, use_container_width=True)
+        
+        # Download
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False)
+        st.download_button("📥 Download Excel Report", buf.getvalue(), "Invoices.xlsx")
     else:
-        st.warning("No PDFs found inside those ZIP files.")
+        status.update(label="No PDFs found.", state="error")
