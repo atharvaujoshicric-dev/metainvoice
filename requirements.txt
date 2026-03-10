@@ -2,3 +2,5 @@ streamlit
 anthropic
 openpyxl
 pandas
+pdfplumber
+xlsxwriter
