@@ -6,125 +6,123 @@ import zipfile
 import io
 
 # --- 1. Page Config ---
-st.set_page_config(page_title="Invoice Intel", page_icon="💎", layout="wide")
+st.set_page_config(page_title="Invoice Intel Pro", page_icon="💎", layout="wide")
 
-# UI Polish
+# Modern Styling
 st.markdown("""
     <style>
-    .block-container { padding-top: 2rem; }
-    .stMetric { border: 1px solid #e1e4e8; padding: 10px; border-radius: 8px; background: white; }
+    .stMetric { border: 1px solid #e1e4e8; padding: 15px; border-radius: 10px; background-color: white; }
+    .main { background-color: #f8f9fa; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- 2. Logic & Caching ---
+# --- 2. Helper Functions ---
 
 def clean_amt(value):
-    if not value: return 0.0
+    if not value or value == "N/A": return 0.0
     clean_val = re.sub(r'[^\d.]', '', str(value))
     try: return float(clean_val)
     except: return 0.0
 
-@st.cache_data(show_spinner="Extracting files from ZIPs...")
-def get_all_pdfs(uploaded_files):
-    """Recursively finds all PDFs and returns a list of (filename, bytes)."""
-    pdf_list = []
-    
-    def process_zip(zip_data):
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+@st.cache_data(show_spinner="Unpacking ZIP layers...")
+def recursive_get_pdfs(zip_bytes):
+    """Deep scan for PDFs in nested ZIP structures."""
+    pdf_files = []
+    def extract_recursive(data):
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
             for info in z.infolist():
                 if info.is_dir(): continue
                 content = z.read(info.filename)
                 if info.filename.lower().endswith('.pdf'):
-                    pdf_list.append((info.filename, content))
+                    pdf_files.append((info.filename, content))
                 elif info.filename.lower().endswith('.zip'):
-                    process_zip(content) # Recursive call
+                    extract_recursive(content)
+    extract_recursive(zip_bytes)
+    return pdf_files
 
-    for uploaded_file in uploaded_files:
-        process_zip(uploaded_file.read())
-    return pdf_list
-
-def extract_data(pdf_content):
+def parse_pdf(content):
+    """Extracts data from PDF bytes with error handling."""
     try:
-        with pdfplumber.open(io.BytesIO(pdf_content)) as pdf:
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
             text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
         
-        # Robust Regex
+        # Regex patterns
         patterns = {
-            "Invoice Number": r"Invoice (?:no\.|ID)\s*([A-Z0-9-]+)",
-            "Project": r"Tax invoice for\s+(.*)",
-            "Subtotal": r"Subtotal:\s+([\d,.]+)",
-            "IGST": r"IGST\s\(18%\):\s+([\d,.]+)",
-            "Date": r"(\d{1,2}\s[A-Za-z]{3}\s\d{4})",
-            "GSTIN": r"GSTIN:\s+([A-Z0-9]{15})"
+            "inv": r"Invoice (?:no\.|ID)\s*([A-Z0-9-]+)",
+            "proj": r"Tax invoice for\s+(.*)",
+            "sub": r"Subtotal:\s+([\d,.]+)",
+            "tax": r"IGST\s\(18%\):\s+([\d,.]+)",
+            "date": r"(\d{1,2}\s[A-Za-z]{3}\s\d{4})",
+            "gst": r"GSTIN:\s+([A-Z0-9]{15})"
         }
         
-        data = {k: (re.search(v, text).group(1) if re.search(v, text) else "N/A") for k, v in patterns.items()}
-        
-        # Calculations
-        sub = clean_amt(data["Subtotal"])
-        igst = clean_amt(data["IGST"])
+        res = {k: (re.search(v, text).group(1) if re.search(v, text) else "N/A") for k, v in patterns.items()}
+        s_val, t_val = clean_amt(res['sub']), clean_amt(res['tax'])
         
         return {
-            "Invoice #": data["Invoice Number"],
-            "Project Name": data["Project"].strip(),
-            "Subtotal": sub,
-            "IGST": igst,
-            "Total": sub + igst,
-            "Date": data["Date"],
-            "GSTIN": data["GSTIN"]
+            "Invoice #": res['inv'],
+            "Project Name": res['proj'].strip(),
+            "Subtotal": s_val,
+            "IGST": t_val,
+            "Total": s_val + t_val,
+            "Date": res['date'],
+            "GSTIN": res['gst']
         }
-    except: return None
+    except Exception:
+        return None
 
-# --- 3. UI ---
+# --- 3. UI Flow ---
+
 st.title("💎 Invoice Intel Pro")
-st.info("Upload your folders/ZIPs below. I'll dig through all nested layers for you.")
+st.write("Upload folders or ZIPs. I'll handle the extraction and formatting.")
 
-files = st.file_uploader("Drop ZIP files here", type="zip", accept_multiple_files=True)
+uploaded_zips = st.file_uploader("Upload ZIP files", type="zip", accept_multiple_files=True)
 
-if files:
-    # Get all PDFs once (Cached)
-    all_pdfs = get_all_pdfs(files)
+if uploaded_zips:
+    all_pdfs = []
+    for f in uploaded_zips:
+        all_pdfs.extend(recursive_get_pdfs(f.read()))
     
     if all_pdfs:
-        st.write(f"📂 Found **{len(all_pdfs)}** PDF invoices. Starting deep-scan...")
+        st.success(f"🔍 Found {len(all_pdfs)} PDFs. Extracting data...")
         
+        # Progress Tracking
+        progress_bar = st.progress(0)
+        status_text = st.empty()
         results = []
-        prog_container = st.empty()
-        bar = st.progress(0)
-        
-        for i, (name, content) in enumerate(all_pdfs):
-            # Calculate and update progress
-            percent = (i + 1) / len(all_pdfs)
-            bar.progress(percent)
-            prog_container.caption(f"Processing {i+1}/{len(all_pdfs)}: **{name[:40]}...**")
+
+        for idx, (name, content) in enumerate(all_pdfs):
+            # Update Progress
+            curr_progress = (idx + 1) / len(all_pdfs)
+            progress_bar.progress(curr_progress)
+            status_text.caption(f"Processing {idx+1}/{len(all_pdfs)}: **{name[:40]}**")
             
-            data = extract_data(content)
+            data = parse_pdf(content)
             if data: results.append(data)
         
-        bar.empty()
-        prog_container.empty()
+        status_text.empty()
+        progress_bar.empty()
 
         if results:
             df = pd.DataFrame(results)
             
-            # Dashboard Metrics
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Invoices", len(df))
-            m2.metric("Total (INR)", f"₹{df['Total'].sum():,.2f}")
-            m3.metric("Tax Amount", f"₹{df['IGST'].sum():,.2f}")
+            # Dashboard
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total Invoices", len(df))
+            c2.metric("Net Amount", f"₹{df['Total'].sum():,.2f}")
+            c3.metric("Tax Collected", f"₹{df['IGST'].sum():,.2f}")
 
-            # Elegant Table
             st.dataframe(df.style.format({"Subtotal": "{:,.2f}", "IGST": "{:,.2f}", "Total": "{:,.2f}"}), use_container_width=True)
 
-            # Excel Download
-            buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-                df.to_excel(writer, index=False, sheet_name='Report')
-                # Currency format for Excel
-                workbook = writer.book
-                fmt = workbook.add_format({'num_format': '#,##0.00 "INR"'})
-                writer.sheets['Report'].set_column('C:E', 15, fmt)
+            # Excel Generation
+            out = io.BytesIO()
+            with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='Data')
+                book = writer.book
+                sheet = writer.sheets['Data']
+                curr_fmt = book.add_format({'num_format': '#,##0.00 "INR"'})
+                sheet.set_column('C:E', 15, curr_fmt)
 
-            st.download_button("📥 Download Master Excel Report", buf.getvalue(), "Invoice_Report.xlsx", "application/vnd.ms-excel")
+            st.download_button("📥 Download Excel Report", out.getvalue(), "Invoices.xlsx", "application/vnd.ms-excel")
     else:
-        st.warning("No PDFs found in those ZIPs.")
+        st.warning("No PDFs found inside those ZIP files.")
