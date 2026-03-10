@@ -5,12 +5,20 @@ import re
 import zipfile
 import io
 
-# --- 1. Basic Config ---
+# --- 1. Page Config & Visuals ---
 st.set_page_config(page_title="Invoice Intel Pro", page_icon="🧾", layout="wide")
 
 st.markdown("""
     <style>
-    .stMetric { border: 1px solid #e1e4e8; padding: 10px; border-radius: 10px; background-color: #ffffff; }
+    .stProgress > div > div > div > div {
+        background-image: linear-gradient(to right, #00dbde 0%, #fc00ff 100%);
+    }
+    .metric-container {
+        background-color: #ffffff;
+        padding: 20px;
+        border-radius: 10px;
+        border: 1px solid #e1e4e8;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -20,79 +28,114 @@ def clean_amt(value):
     try: return float(val)
     except: return 0.0
 
-def process_pdfs_recursively(zip_bytes):
-    """Memory-efficient recursive PDF finder."""
-    extracted_data = []
+# --- 2. Recursive File Discovery ---
+def get_file_list(uploaded_files):
+    """Gathers all PDF paths first so we can calculate a real percentage."""
+    all_pdfs = []
     
-    def walk_zip(data):
+    def walk_zip(data, prefix=""):
         with zipfile.ZipFile(io.BytesIO(data)) as z:
-            for filename in z.namelist():
-                if filename.startswith('__MACOSX'): continue # Ignore Mac system files
+            for info in z.infolist():
+                if info.is_dir() or info.filename.startswith('__MACOSX'): continue
                 
-                content = z.read(filename)
-                if filename.lower().endswith('.pdf'):
-                    # Process PDF
-                    with pdfplumber.open(io.BytesIO(content)) as pdf:
-                        text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
+                content = z.read(info.filename)
+                if info.filename.lower().endswith('.pdf'):
+                    all_pdfs.append((prefix + info.filename, content))
+                elif info.filename.lower().endswith('.zip'):
+                    walk_zip(content, prefix=info.filename + " > ")
                     
-                    # Regex Extraction
-                    inv = re.search(r"Invoice (?:no\.|ID)\s*([A-Z0-9-]+)", text)
-                    proj = re.search(r"Tax invoice for\s+(.*)", text)
-                    sub = re.search(r"Subtotal:\s+([\d,.]+)", text)
-                    tax = re.search(r"IGST\s\(18%\):\s+([\d,.]+)", text)
-                    
-                    s_val = clean_amt(sub.group(1)) if sub else 0.0
-                    t_val = clean_amt(tax.group(1)) if tax else 0.0
-                    
-                    extracted_data.append({
-                        "Invoice #": inv.group(1) if inv else "N/A",
-                        "Project": proj.group(1).strip() if proj else "N/A",
-                        "Subtotal": s_val,
-                        "IGST": t_val,
-                        "Total": s_val + t_val,
-                        "File Source": filename.split('/')[-1]
-                    })
-                elif filename.lower().endswith('.zip'):
-                    walk_zip(content) # Dig deeper
+    for f in uploaded_files:
+        walk_zip(f.read(), prefix=f.name + " > ")
+    return all_pdfs
 
-    walk_zip(zip_bytes)
-    return extracted_data
+# --- 3. Main UI ---
+st.title("🧾 Real-Time Invoice Extractor")
+st.write("Processing multiple nested ZIPs with live tracking.")
 
-# --- 2. Main UI ---
-st.title("🧾 Invoice Intel Pro")
-st.write("Deep-scan recursive PDF extractor")
-
-files = st.file_uploader("Upload ZIP files", type="zip", accept_multiple_files=True)
+files = st.file_uploader("Upload ZIP folders", type="zip", accept_multiple_files=True)
 
 if files:
-    all_results = []
-    with st.status("🔍 Deep scanning and extracting...", expanded=True) as status:
-        for f in files:
+    # 1. Pre-scan (Fast)
+    with st.spinner("🔍 Mapping folder structure..."):
+        all_pdf_files = get_file_list(files)
+    
+    if all_pdf_files:
+        total_files = len(all_pdf_files)
+        st.write(f"📂 Found **{total_files}** invoices to process.")
+        
+        # 2. Setup Real-Time UI Elements
+        progress_text = st.empty()
+        progress_bar = st.progress(0)
+        status_box = st.empty()
+        
+        all_results = []
+
+        # 3. Process with Real-Time Updates
+        for idx, (name, content) in enumerate(all_pdf_files):
+            # Calculate Percentage
+            percent_val = (idx + 1) / total_files
+            
+            # Update UI in real-time
+            progress_bar.progress(percent_val)
+            progress_text.markdown(f"**Processing:** `{name.split(' > ')[-1]}`")
+            status_box.caption(f"File {idx + 1} of {total_files} ({int(percent_val * 100)}%)")
+            
             try:
-                data = process_pdfs_recursively(f.read())
-                all_results.extend(data)
+                with pdfplumber.open(io.BytesIO(content)) as pdf:
+                    text = "\n".join([p.extract_text() for p in pdf.pages if p.extract_text()])
+                
+                # Extraction
+                inv = re.search(r"Invoice (?:no\.|ID)\s*([A-Z0-9-]+)", text)
+                proj = re.search(r"Tax invoice for\s+(.*)", text)
+                sub = re.search(r"Subtotal:\s+([\d,.]+)", text)
+                tax = re.search(r"IGST\s\(18%\):\s+([\d,.]+)", text)
+                
+                s_val = clean_amt(sub.group(1)) if sub else 0.0
+                t_val = clean_amt(tax.group(1)) if tax else 0.0
+                
+                all_results.append({
+                    "Invoice #": inv.group(1) if inv else "N/A",
+                    "Project": proj.group(1).strip() if proj else "N/A",
+                    "Subtotal": s_val,
+                    "IGST": t_val,
+                    "Total": s_val + t_val,
+                    "Location": name
+                })
             except Exception as e:
-                st.error(f"Error reading {f.name}: {e}")
-        status.update(label="Processing Complete!", state="complete")
+                st.error(f"Could not read {name}: {e}")
 
-    if all_results:
-        df = pd.DataFrame(all_results)
-        
-        # Dashboard
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Total Invoices", len(df))
-        c2.metric("Total (INR)", f"₹{df['Total'].sum():,.2f}")
-        c3.metric("Tax Collected", f"₹{df['IGST'].sum():,.2f}")
+        # Clear progress elements once done
+        progress_text.empty()
+        progress_bar.empty()
+        status_box.success(f"🎯 Successfully processed {len(all_results)} invoices!")
 
-        st.dataframe(df, use_container_width=True)
+        # --- 4. Final Results ---
+        if all_results:
+            df = pd.DataFrame(all_results)
+            
+            # Dashboard Metrics
+            m1, m2, m3 = st.columns(3)
+            with m1: st.metric("Invoices", len(df))
+            with m2: st.metric("Total Revenue", f"₹{df['Total'].sum():,.2f}")
+            with m3: st.metric("Tax Amount", f"₹{df['IGST'].sum():,.2f}")
 
-        # Excel Export
-        buf = io.BytesIO()
-        with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name='Data')
-            workbook = writer.book
-            sheet = writer.sheets['Data']
-            fmt = workbook.add_format({'num_format': '#,##0.00 "INR"'})
-            sheet.set_column('C:E', 15, fmt)
-        
-        st.download_button("📥 Download Excel", buf.getvalue(), "Invoices.xlsx")
+            st.subheader("📊 Data Preview")
+            st.dataframe(df, use_container_width=True)
+
+            # Excel Export
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
+                df.to_excel(writer, index=False, sheet_name='Invoices')
+                workbook = writer.book
+                sheet = writer.sheets['Invoices']
+                fmt = workbook.add_format({'num_format': '#,##0.00 "INR"'})
+                sheet.set_column('C:E', 18, fmt)
+            
+            st.download_button(
+                label="📥 Download Formatted Excel",
+                data=buf.getvalue(),
+                file_name="Invoice_Master_Report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+    else:
+        st.warning("No PDFs found in the uploaded ZIPs.")
