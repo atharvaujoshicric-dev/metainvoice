@@ -23,17 +23,19 @@ def extract_single_pdf(content, filename=""):
                 if page_text:
                     text += page_text + "\n"
 
-        # Enhanced Patterns
         patterns = {
             "inv": [
                 r"Invoice\s*(?:No\.?|ID|#|Number)[:\s]*([A-Z0-9/_-]+)",
                 r"Inv\s*#?\s*[:\s]*([A-Z0-9/_-]+)",
             ],
             "proj": [
-                # Specific request: Name under "Campaigns - Advertising service..."
-                r"Campaigns\s*-\s*Advertising\s*service\s*[^\n]*\n\s*(.*)",
-                r"Project\s*[:\-]\s*(.*)",
+                # Specifically targets the name under the Campaign/HSN section
+                r"Campaigns\s*-\s*Advertising\s*service\s*HSN\s*code/SAC\s*code\s*\n\s*(.*)",
                 r"Description\s*[:\-]\s*(.*)",
+            ],
+            "gstin": [
+                # Extract Indian GSTIN format
+                r"GSTIN\s*[:\-]?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})",
             ],
             "sub": [
                 r"Sub\s*[Tt]otal\s*[:\-]?\s*([\d,. ]+)",
@@ -49,28 +51,20 @@ def extract_single_pdf(content, filename=""):
                 r"Total\s+Amount\s*[:\-]?\s*([\d,. ]+)",
                 r"\bTotal\b\s*[:\-]?\s*([\d,. ]+)",
             ],
-            "gstin": [
-                # Standard Indian GSTIN Regex
-                r"GSTIN\s*[:\-]?\s*([0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1})",
-            ]
         }
 
         def find_first(key):
             for pat in patterns[key]:
                 m = re.search(pat, text, re.IGNORECASE)
-                if m:
-                    return m.group(1).strip()
+                if m: return m.group(1).strip()
             return "N/A"
 
         inv   = find_first("inv")
         proj  = find_first("proj")
         gstin = find_first("gstin")
-        sub_s = find_first("sub")
-        tax_s = find_first("tax")
+        s_val = clean_amt(find_first("sub"))
+        t_val = clean_amt(find_first("tax"))
         tot_s = find_first("total")
-
-        s_val = clean_amt(sub_s)
-        t_val = clean_amt(tax_s)
         grand = clean_amt(tot_s) if tot_s != "N/A" else s_val + t_val
 
         return {
@@ -84,16 +78,7 @@ def extract_single_pdf(content, filename=""):
             "_raw_text": text[:2000],
         }
     except Exception as e:
-        return {
-            "File": filename,
-            "Invoice #": "ERROR",
-            "Project": str(e),
-            "GSTIN": "N/A",
-            "Subtotal": 0.0,
-            "IGST/Tax": 0.0,
-            "Total": 0.0,
-            "_raw_text": "",
-        }
+        return {"File": filename, "Invoice #": "ERROR", "Project": str(e), "GSTIN": "N/A", "Subtotal": 0.0, "IGST/Tax": 0.0, "Total": 0.0}
 
 def walk_zip(zip_bytes, parent_path="", results=None, status_fn=None):
     if results is None: results = []
@@ -103,77 +88,74 @@ def walk_zip(zip_bytes, parent_path="", results=None, status_fn=None):
                 if "__MACOSX" in entry or entry.startswith(".") or entry.endswith("/"):
                     continue
                 full_path = f"{parent_path}/{entry}" if parent_path else entry
-                if entry.lower().endswith(".pdf"):
-                    if status_fn: status_fn(f"📄 {full_path[:70]}…")
+                
+                # If nested ZIP, dive deeper
+                if entry.lower().endswith(".zip"):
                     with z.open(entry) as f:
-                        pdf_bytes = f.read()
-                    result = extract_single_pdf(pdf_bytes, filename=full_path)
-                    if result: results.append(result)
+                        walk_zip(f.read(), full_path, results, status_fn)
+                # If PDF, extract
+                elif entry.lower().endswith(".pdf"):
+                    if status_fn: status_fn(f"📄 Processing: {entry}")
+                    with z.open(entry) as f:
+                        results.append(extract_single_pdf(f.read(), full_path))
                     gc.collect()
-                elif entry.lower().endswith(".zip"):
-                    if status_fn: status_fn(f"📦 Opening nested ZIP: {full_path[:70]}…")
-                    with z.open(entry) as f:
-                        nested_bytes = f.read()
-                    walk_zip(nested_bytes, parent_path=full_path, results=results, status_fn=status_fn)
     except Exception as e:
-        results.append({"File": parent_path or "unknown", "Invoice #": "ZIP ERROR", "Project": str(e)})
+        results.append({"File": parent_path, "Invoice #": "ZIP ERROR", "Project": str(e)})
     return results
 
 # ── UI ──────────────────────────────────────────────────────────────────────────
-st.title("📂 Invoice Intel Pro")
-st.caption("Recursively extracts PDF invoices from any ZIP structure.")
+st.title("📂 Universal Invoice Intel")
+st.caption("Upload PDFs, ZIPs, or nested ZIPs. We'll find every invoice.")
 
-debug_mode = st.sidebar.checkbox("🐛 Debug mode (show raw PDF text)", value=False)
-uploaded_files = st.file_uploader("Upload ZIP file(s)", type="zip", accept_multiple_files=True)
+debug_mode = st.sidebar.checkbox("🐛 Debug mode", value=False)
+
+uploaded_files = st.file_uploader(
+    "Drop files here (PDF or ZIP)", 
+    type=["pdf", "zip"], 
+    accept_multiple_files=True
+)
 
 if uploaded_files:
     all_data = []
     status_text = st.empty()
-    progress_bar = st.progress(0)
-
-    for i, up_file in enumerate(uploaded_files):
-        status_text.text(f"🔍 Scanning {up_file.name}…")
-        zip_bytes = up_file.read()
-        results = walk_zip(zip_bytes, parent_path=up_file.name, status_fn=lambda msg: status_text.text(msg))
-        all_data.extend(results)
-        progress_bar.progress((i + 1) / len(uploaded_files))
+    
+    for up_file in uploaded_files:
+        file_bytes = up_file.read()
+        
+        if up_file.name.lower().endswith(".pdf"):
+            status_text.text(f"📄 Processing direct PDF: {up_file.name}")
+            all_data.append(extract_single_pdf(file_bytes, up_file.name))
+        
+        elif up_file.name.lower().endswith(".zip"):
+            status_text.text(f"📦 Unpacking ZIP: {up_file.name}")
+            walk_zip(file_bytes, up_file.name, all_data, lambda m: status_text.text(m))
 
     status_text.empty()
-    progress_bar.empty()
 
     if all_data:
-        # Define specific column order including new GSTIN
+        df = pd.DataFrame(all_data)
         display_cols = ["File", "Invoice #", "Project", "GSTIN", "Subtotal", "IGST/Tax", "Total"]
-        df_full = pd.DataFrame(all_data)
+        # Ensure columns exist
+        for c in display_cols: 
+            if c not in df.columns: df[c] = "N/A"
         
-        # Ensure all columns exist even if error occurred
-        for col in display_cols:
-            if col not in df_full.columns: df_full[col] = "N/A"
-            
-        df = df_full[display_cols]
+        st.dataframe(df[display_cols], use_container_width=True)
+        
+        # Total Summary Metrics
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Invoices", len(df))
+        c2.metric("Total Tax (IGST)", f"₹{df['IGST/Tax'].sum():,.2f}")
+        c3.metric("Grand Total", f"₹{df['Total'].sum():,.2f}")
 
-        # ── Metrics ──
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("📄 Invoices Found", len(df))
-        c2.metric("💰 Total Value", f"₹{df['Total'].sum():,.2f}")
-        c3.metric("🧾 Total Tax", f"₹{df['IGST/Tax'].sum():,.2f}")
-        c4.metric("🏢 Unique GSTINs", df['GSTIN'].nunique() if 'GSTIN' in df else 0)
-
-        st.divider()
-        st.subheader("Extracted Records")
-        st.dataframe(df, use_container_width=True, height=450)
-
-        # ── Excel download ──
+        # Excel Download
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name="Invoices")
-        st.download_button("📥 Download Excel Report", data=buf.getvalue(), file_name="InvoiceReport.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
+            df[display_cols].to_excel(writer, index=False)
+        st.download_button("📥 Download Report", buf.getvalue(), "Invoice_Report.xlsx")
+        
         if debug_mode:
-            st.divider()
-            st.subheader("🐛 Raw Extracted Text")
             for row in all_data:
-                with st.expander(f"📄 {row['File']}"):
-                    st.text(row.get("_raw_text", "") or "(no text found)")
+                with st.expander(f"Raw Text: {row['File']}"):
+                    st.text(row.get("_raw_text", "No text"))
     else:
-        st.error("❌ No PDFs found.")
+        st.warning("No data extracted. Please check your files.")
